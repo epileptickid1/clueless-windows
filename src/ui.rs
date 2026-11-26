@@ -1,4 +1,4 @@
-//! The window and the logic connecting audio, transcription and Claude.
+//! The window and the logic connecting audio, transcription and model providers.
 //!
 //! Rule for this file: never hold a `state` borrow while changing a widget that
 //! has a signal handler, because the handler runs immediately and borrows too.
@@ -15,9 +15,9 @@ use gtk4 as gtk;
 use serde_json::{Value, json};
 
 use crate::audio::{self, Capture, Source, Speaker};
-use crate::claude::{Claude, ClaudeEvent};
-use crate::config::{self, Settings};
-use crate::event::Event;
+use crate::backend::Backend;
+use crate::config::{self, Provider, Settings};
+use crate::event::{Event, ModelChoice, ModelEvent};
 use crate::files::{self, Attachment};
 use crate::gate::{Gate, Reason};
 use crate::{kwin, render, stt};
@@ -28,7 +28,7 @@ const ALL_AUDIO: &str = "All system audio";
 /// Recent lines repeated in every answer request, so that a question split by
 /// pauses is always seen whole.
 const CONTEXT_LINES: usize = 20;
-/// Claude's reply when there is no complete question to answer.
+/// The model's reply when there is no complete question to answer.
 const WAIT: &str = "[WAIT]";
 /// A streaming answer this long without `<say>` tags is shown as it is.
 const UNTAGGED: usize = 400;
@@ -104,16 +104,23 @@ impl Turn {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Restart {
+    Resume,
+    NewSession,
+}
+
 #[derive(Default)]
 struct State {
     settings: Settings,
-    claude: Option<Claude>,
+    backend: Option<Backend>,
+    model_choices: Vec<ModelChoice>,
     generation: u64,
     session: Option<String>,
     /// The session has at least one finished turn, so it can be resumed.
     resumable: bool,
     turn: Option<Turn>,
-    restart_after_turn: bool,
+    restart_after_turn: Option<Restart>,
     dirty: bool,
     attachments: Vec<Attachment>,
     transcript: Vec<Line>,
@@ -130,11 +137,47 @@ struct State {
     sink: Option<(String, Instant)>,
 }
 
+impl State {
+    fn disconnect_backend(&mut self) {
+        self.backend = None;
+        self.generation += 1;
+    }
+
+    fn clear_session(&mut self) {
+        self.session = None;
+        self.resumable = false;
+        self.sent = 0;
+    }
+
+    fn restart_backend_after_reply(&mut self, restart: Restart) {
+        if self.turn.is_some() {
+            self.restart_after_turn = Some(restart);
+        } else {
+            self.disconnect_backend();
+            if restart == Restart::NewSession {
+                self.clear_session();
+            }
+        }
+    }
+
+    fn ensure_backend(&mut self, events: &Sender<Event>) -> anyhow::Result<()> {
+        if self.backend.is_none() {
+            self.generation += 1;
+            let resume = self.session.as_deref().filter(|_| self.resumable);
+            self.backend = Some(Backend::spawn(&self.settings, resume, self.generation, events.clone())?);
+        }
+        Ok(())
+    }
+}
+
 pub struct App {
     window: gtk::ApplicationWindow,
     css: gtk::CssProvider,
     listen: gtk::ToggleButton,
     source: gtk::DropDown,
+    provider: gtk::DropDown,
+    model: gtk::DropDown,
+    fast: gtk::CheckButton,
     level: gtk::LevelBar,
     transcript: gtk::TextView,
     chat: gtk::TextView,
@@ -152,6 +195,8 @@ pub struct App {
     state: RefCell<State>,
     events: Sender<Event>,
     refreshing: Cell<bool>,
+    updating_models: Cell<bool>,
+    discard_screenshot: Cell<bool>,
 }
 
 fn css(opacity: f64) -> String {
@@ -255,11 +300,11 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
         .default_height(720)
         .build();
     window.add_css_class("clueless");
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(&css(settings.opacity));
+    let stylesheet = gtk::CssProvider::new();
+    stylesheet.load_from_string(&css(settings.opacity));
     if let Some(display) = gdk::Display::default() {
         // Above the user's own gtk.css, which would otherwise paint it opaque.
-        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_USER + 1);
+        gtk::style_context_add_provider_for_display(&display, &stylesheet, gtk::STYLE_PROVIDER_PRIORITY_USER + 1);
     }
 
     let header = gtk::HeaderBar::new();
@@ -269,7 +314,7 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     opacity.set_tooltip_text(Some("Window opacity"));
     let pin = gtk::CheckButton::with_label("On top");
     pin.set_active(settings.keep_above);
-    pin.set_tooltip_text(Some("Keep above other windows (KDE Plasma)"));
+    pin.set_tooltip_text(Some(if cfg!(windows) { "Keep above other windows" } else { "Keep above other windows (KDE Plasma)" }));
     header.pack_start(&opacity);
     header.pack_start(&pin);
     window.set_titlebar(Some(&header));
@@ -282,6 +327,10 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     source.set_tooltip_text(Some("What to listen to"));
     let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh.set_tooltip_text(Some("Rescan apps and tabs that are playing sound"));
+    if cfg!(windows) {
+        source.set_sensitive(false);
+        refresh.set_visible(false);
+    }
     let mic = gtk::CheckButton::with_label("Mic");
     mic.set_active(settings.microphone);
     mic.set_tooltip_text(Some("Also transcribe your microphone (use headphones)"));
@@ -308,9 +357,17 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     language_box.set_tooltip_text(Some(
         "Meeting language. Multilingual does not cover Ukrainian or Polish; choose those explicitly.",
     ));
-    let model = gtk::DropDown::from_strings(config::MODELS);
-    model.set_selected(settings.model);
-    model.set_tooltip_text(Some("Claude model"));
+    let provider = gtk::DropDown::from_strings(&Provider::ALL.map(Provider::label));
+    provider.set_selected(settings.provider.index());
+    provider.set_tooltip_text(Some("Model provider"));
+    let model = gtk::DropDown::from_strings(&[]);
+    model.set_hexpand(true);
+    model.set_factory(Some(&ellipsizing_factory()));
+    model.set_tooltip_text(Some("Model"));
+    let fast = gtk::CheckButton::with_label("Fast mode");
+    fast.set_active(settings.codex_fast);
+    fast.set_visible(settings.provider == Provider::Codex);
+    fast.set_tooltip_text(Some("Request Codex Fast service for the next answer"));
     let new_chat = gtk::Button::with_label("New chat");
     let answer = gtk::Button::with_label("Answer now");
     answer.add_css_class("suggested-action");
@@ -319,17 +376,16 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     ));
     let screenshot = gtk::Button::with_label("📷 Screen");
     screenshot.set_tooltip_text(Some(
-        "Screenshot the primary screen and ask Claude about it (Space while not typing)",
+        "Screenshot the primary screen and ask about it (Space while not typing)",
     ));
     answer.set_hexpand(true);
     let control_row = row();
-    for w in [
-        auto.upcast_ref::<gtk::Widget>(),
-        language_box.upcast_ref(),
-        model.upcast_ref(),
-    ] {
-        control_row.append(w);
-    }
+    control_row.append(&auto);
+    control_row.append(&language_box);
+    let model_row = row();
+    model_row.append(&provider);
+    model_row.append(&model);
+    model_row.append(&fast);
     let action_row = row();
     action_row.append(&answer);
     action_row.append(&screenshot);
@@ -399,6 +455,7 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     root.set_margin_end(8);
     root.append(&audio_row);
     root.append(&control_row);
+    root.append(&model_row);
     root.append(&action_row);
     root.append(&paned);
     root.append(&live);
@@ -412,9 +469,12 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     let keep_above = settings.keep_above;
     let app = Rc::new(App {
         window: window.clone(),
-        css: provider,
+        css: stylesheet,
         listen,
         source,
+        provider,
+        model,
+        fast,
         level,
         transcript,
         chat,
@@ -433,11 +493,13 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
         }),
         events,
         refreshing: Cell::new(false),
+        updating_models: Cell::new(false),
+        discard_screenshot: Cell::new(false),
     });
 
     render::append(
         &app.chat.buffer(),
-        "Attach your materials (button or drag and drop), tell Claude what you need, then press ● Listen.\n",
+        "Attach your materials (button or drag and drop), send a message or press ● Listen.\n",
         &["dim"],
     );
 
@@ -450,7 +512,9 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     let a = app.clone();
     pin.connect_toggled(move |b| {
         a.change_settings(|c| c.keep_above = b.is_active());
-        kwin::apply_in_background(b.is_active());
+        if let Err(error) = kwin::apply_in_background(&a.window, b.is_active()) {
+            a.set_status(&format!("Cannot change window position: {error}"));
+        }
     });
     let a = app.clone();
     app.listen.connect_toggled(move |b| {
@@ -480,13 +544,24 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
         a.restart_listening();
     });
     let a = app.clone();
-    model.connect_selected_notify(move |d| {
-        a.change_settings(|c| c.model = d.selected());
+    app.provider.connect_selected_notify(move |d| {
+        if let Some(&provider) = Provider::ALL.get(d.selected() as usize) {
+            a.select_provider(provider);
+        }
+    });
+    let a = app.clone();
+    app.model.connect_selected_notify(move |d| {
+        if !a.updating_models.get() {
+            a.select_model(d.selected() as usize);
+        }
+    });
+    let a = app.clone();
+    app.fast.connect_toggled(move |b| {
         let mut s = a.state.borrow_mut();
-        if s.turn.is_some() {
-            s.restart_after_turn = true;
-        } else {
-            s.claude = None;
+        s.settings.codex_fast = b.is_active();
+        s.settings.save();
+        if s.settings.provider == Provider::Codex && s.restart_after_turn != Some(Restart::NewSession) {
+            s.restart_backend_after_reply(Restart::Resume);
         }
     });
     let a = app.clone();
@@ -594,7 +669,11 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
         // Stop child processes explicitly; signal closures keep `App` alive.
         let mut s = a.state.borrow_mut();
         s.captures.clear();
-        s.claude = None;
+        s.disconnect_backend();
+        s.turn = None;
+        s.answer_wanted = None;
+        s.gate.reset();
+        a.discard_screenshot.set(true);
         glib::Propagation::Proceed
     });
 
@@ -605,11 +684,20 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     });
 
     app.refresh_sources();
+    app.show_models(Vec::new());
     window.present();
     app.input.grab_focus();
     if keep_above {
-        glib::timeout_add_local_once(Duration::from_millis(700), || kwin::apply_in_background(true));
+        let a = app.clone();
+        glib::timeout_add_local_once(Duration::from_millis(700), move || {
+            if a.state.borrow().settings.keep_above
+                && let Err(error) = kwin::apply_in_background(&a.window, true)
+            {
+                a.set_status(&format!("Cannot change window position: {error}"));
+            }
+        });
     }
+    app.prepare_model_list();
     app
 }
 
@@ -622,6 +710,87 @@ impl App {
         let mut s = self.state.borrow_mut();
         change(&mut s.settings);
         s.settings.save();
+    }
+
+    fn prepare_model_list(&self) {
+        let result = {
+            let mut s = self.state.borrow_mut();
+            if s.settings.provider == Provider::Claude {
+                return;
+            }
+            s.ensure_backend(&self.events)
+        };
+        if let Err(error) = result {
+            self.set_status(&format!("{error:#}"));
+        }
+    }
+
+    fn select_provider(&self, provider: Provider) {
+        {
+            let mut s = self.state.borrow_mut();
+            if s.settings.provider == provider {
+                return;
+            }
+            if s.turn.is_some() || !self.screenshot.is_sensitive() {
+                let current = s.settings.provider;
+                drop(s);
+                self.provider.set_selected(current.index());
+                return;
+            }
+            s.disconnect_backend();
+            s.clear_session();
+            s.answer_wanted = None;
+            s.gate.cancel();
+            s.settings.provider = provider;
+            s.settings.save();
+        }
+        self.fast.set_visible(provider == Provider::Codex);
+        self.show_models(Vec::new());
+        self.set_status(&format!("{} selected. The next request starts a new conversation.", provider.label()));
+        self.prepare_model_list();
+    }
+
+    fn show_models(&self, discovered: Vec<ModelChoice>) {
+        let (choices, selected) = {
+            let mut s = self.state.borrow_mut();
+            let saved = s.settings.model_id();
+            let mut choices: Vec<ModelChoice> = if s.settings.provider == Provider::Claude {
+                config::MODELS.iter().map(|&id| ModelChoice { id: id.into(), label: id.into() }).collect()
+            } else {
+                let mut choices = vec![ModelChoice { id: String::new(), label: "CLI default".into() }];
+                for choice in discovered {
+                    if !choices.iter().any(|existing| existing.id == choice.id) {
+                        choices.push(choice);
+                    }
+                }
+                choices
+            };
+            let selected = choices.iter().position(|choice| choice.id == saved).unwrap_or_else(|| {
+                choices.push(ModelChoice { id: saved.into(), label: saved.into() });
+                choices.len() - 1
+            });
+            s.model_choices = choices;
+            let labels = s.model_choices.iter().map(|choice| choice.label.clone()).collect::<Vec<_>>();
+            (labels, selected)
+        };
+        let labels: Vec<&str> = choices.iter().map(String::as_str).collect();
+        self.updating_models.set(true);
+        self.model.set_model(Some(&gtk::StringList::new(&labels)));
+        self.model.set_selected(selected as u32);
+        self.updating_models.set(false);
+    }
+
+    fn select_model(&self, index: usize) {
+        let mut s = self.state.borrow_mut();
+        let Some(choice) = s.model_choices.get(index) else { return };
+        if choice.id == s.settings.model_id() {
+            return;
+        }
+        let id = choice.id.clone();
+        let restart = if id.is_empty() { Restart::NewSession } else { Restart::Resume };
+        s.settings.select_model(id);
+        s.settings.save();
+        s.restart_backend_after_reply(restart);
     }
 
     fn chat_append(&self, text: &str, tags: &[&str]) {
@@ -881,6 +1050,7 @@ impl App {
             return;
         }
         self.screenshot.set_sensitive(false);
+        self.provider.set_sensitive(false);
         self.set_status("Taking a screenshot of the primary screen…");
         let events = self.events.clone();
         std::thread::spawn(move || {
@@ -891,6 +1061,9 @@ impl App {
 
     fn screenshot_taken(self: &Rc<Self>, shot: Result<Attachment, String>) {
         self.screenshot.set_sensitive(true);
+        if self.discard_screenshot.replace(false) {
+            return;
+        }
         let shot = match shot {
             Ok(shot) => shot,
             Err(message) => return self.set_status(&message),
@@ -902,7 +1075,7 @@ impl App {
         };
         if busy {
             self.show_chips();
-            self.set_status("Claude is still replying. The screenshot is sent with your next message.");
+            self.set_status("A reply is still in progress. The screenshot is sent with your next message.");
         } else {
             self.submit(LOOK_AT_SCREEN.to_string(), "What is on my screen?", String::new(), None);
         }
@@ -920,7 +1093,7 @@ impl App {
             let s = self.state.borrow();
             if s.turn.is_some() {
                 drop(s);
-                self.set_status("Claude is still replying. Wait, or press Stop.");
+                self.set_status("A reply is still in progress. Wait, or press Stop.");
                 return;
             }
             if draft.is_empty() && s.attachments.is_empty() {
@@ -992,18 +1165,10 @@ impl App {
     fn submit(self: &Rc<Self>, prompt: String, shown: &str, draft: String, ask: Option<Ask>) -> bool {
         let result = {
             let mut s = self.state.borrow_mut();
-            if s.claude.is_none() {
-                s.generation += 1;
-                let model = config::MODELS[s.settings.model as usize % config::MODELS.len()];
-                let resume = s.session.clone().filter(|_| s.resumable);
-                match Claude::spawn(model, resume.as_deref(), s.generation, self.events.clone()) {
-                    Ok(c) => s.claude = Some(c),
-                    Err(e) => {
-                        drop(s);
-                        self.set_status(&format!("{e:#}"));
-                        return false;
-                    }
-                }
+            if let Err(error) = s.ensure_backend(&self.events) {
+                drop(s);
+                self.set_status(&format!("{error:#}"));
+                return false;
             }
             let mut content: Vec<Value> = s.attachments.iter().flat_map(|a| a.blocks.clone()).collect();
             let unsent = s.sent.min(s.transcript.len());
@@ -1019,7 +1184,7 @@ impl App {
                 content.push(json!({"type": "text", "text": block}));
             }
             content.push(json!({"type": "text", "text": prompt}));
-            let sent = s.claude.as_ref().map(|c| c.send(content));
+            let sent = s.backend.as_ref().map(|backend| backend.send(content));
             match sent {
                 Some(Ok(())) => {
                     let attachments = std::mem::take(&mut s.attachments);
@@ -1032,16 +1197,18 @@ impl App {
                         draft,
                         reply: String::new(),
                     });
-                    Ok(names)
+                    Ok((names, s.settings.provider))
                 }
-                _ => {
-                    s.claude = None;
-                    Err("Claude stopped unexpectedly. Try again.")
+                Some(Err(error)) => {
+                    s.disconnect_backend();
+                    Err(format!("{error:#}"))
                 }
+                None => Err("Cannot start the model provider. Try again.".into()),
             }
         };
         match result {
-            Ok(names) => {
+            Ok((names, provider)) => {
+                self.provider.set_sensitive(false);
                 let buffer = self.chat.buffer();
                 buffer.move_mark(&self.turn_start, &buffer.end_iter());
                 self.chat_append("\nYou\n", &["you"]);
@@ -1049,15 +1216,15 @@ impl App {
                     self.chat_append(&format!("📎 {}\n", names.join(", ")), &["dim"]);
                 }
                 self.chat_append(&format!("{shown}\n"), &[]);
-                self.chat_append("\nClaude\n", &["claude"]);
+                self.chat_append(&format!("\n{}\n", provider.label()), &["claude"]);
                 buffer.move_mark(&self.reply_start, &buffer.end_iter());
                 self.chat_append("…\n", &["dim"]);
                 self.show_chips();
-                self.set_status("Claude is thinking…");
+                self.set_status(&format!("{} is thinking…", provider.label()));
                 true
             }
             Err(message) => {
-                self.set_status(message);
+                self.set_status(&message);
                 false
             }
         }
@@ -1081,8 +1248,11 @@ impl App {
             let Some(turn) = s.turn.take() else { return };
             s.dirty = false;
             s.resumable = s.session.is_some();
-            if std::mem::take(&mut s.restart_after_turn) {
-                s.claude = None;
+            if let Some(restart) = s.restart_after_turn.take() {
+                s.disconnect_backend();
+                if restart == Restart::NewSession {
+                    s.clear_session();
+                }
             }
             let reply = if turn.reply.trim().is_empty() {
                 final_text
@@ -1113,7 +1283,8 @@ impl App {
         let mut end = buffer.end_iter();
         buffer.delete(&mut start, &mut end);
         if !files.is_empty() {
-            self.chat_append(&format!("📎 {} sent to Claude\n", files.join(", ")), &["dim"]);
+            let provider = self.state.borrow().settings.provider;
+            self.chat_append(&format!("📎 {} sent to {}\n", files.join(", "), provider.label()), &["dim"]);
         }
         self.set_status(if self.listen.is_active() {
             "No complete question yet. Still listening…"
@@ -1126,17 +1297,18 @@ impl App {
     fn fail_turn(self: &Rc<Self>, message: &str) {
         let (partial, draft) = {
             let mut s = self.state.borrow_mut();
-            let Some(turn) = s.turn.take() else { return };
+            s.disconnect_backend();
+            if s.restart_after_turn.take() == Some(Restart::NewSession) || message.contains("No conversation found") {
+                s.clear_session();
+            }
+            let Some(turn) = s.turn.take() else {
+                drop(s);
+                self.set_status(message);
+                return;
+            };
             s.dirty = false;
-            s.claude = None;
-            s.restart_after_turn = false;
             let partial = turn.visible().to_string();
             s.sent = s.sent.min(turn.transcript_from);
-            if message.contains("No conversation found") {
-                s.session = None;
-                s.resumable = false;
-                s.sent = 0;
-            }
             let newer = std::mem::replace(&mut s.attachments, turn.attachments);
             s.attachments.extend(newer);
             (partial, turn.draft)
@@ -1157,10 +1329,11 @@ impl App {
             s.answer_wanted = None;
             s.gate.cancel();
             let Some(turn) = s.turn.take() else { return };
-            s.claude = None;
-            s.generation += 1;
+            s.disconnect_backend();
             s.dirty = false;
-            s.restart_after_turn = false;
+            if s.restart_after_turn.take() == Some(Restart::NewSession) {
+                s.clear_session();
+            }
             let partial = turn.visible().to_string();
             // The interrupted turn may not have been saved; send its context again.
             s.sent = s.sent.min(turn.transcript_from);
@@ -1175,20 +1348,20 @@ impl App {
     }
 
     fn new_chat(self: &Rc<Self>) {
+        if !self.screenshot.is_sensitive() {
+            self.discard_screenshot.set(true);
+        }
         {
             let mut s = self.state.borrow_mut();
-            s.claude = None;
-            s.generation += 1;
-            s.session = None;
-            s.resumable = false;
+            s.disconnect_backend();
+            s.clear_session();
             s.turn = None;
             s.dirty = false;
-            s.restart_after_turn = false;
+            s.restart_after_turn = None;
             s.answer_wanted = None;
             s.gate.reset();
             s.your_partial.clear();
             s.transcript.clear();
-            s.sent = 0;
         }
         self.show_live();
         self.transcript.buffer().set_text("");
@@ -1204,7 +1377,7 @@ impl App {
         }
         self.follow_default_sink();
 
-        let (reply, ask, busy) = {
+        let (reply, ask) = {
             let mut s = self.state.borrow_mut();
             let reply = if std::mem::take(&mut s.dirty) {
                 // Nothing replaces the "…" until there is something to show.
@@ -1223,7 +1396,7 @@ impl App {
             } else {
                 s.gate.poll(Instant::now()).map(Ask::Heard)
             };
-            (reply, ask, s.turn.is_some())
+            (reply, ask)
         };
         if let Some(text) = reply {
             self.render_reply(&text);
@@ -1231,50 +1404,48 @@ impl App {
         if let Some(ask) = ask {
             self.send_answer(ask);
         }
+        let busy = self.state.borrow().turn.is_some();
         if self.stop.is_visible() != busy {
             self.stop.set_visible(busy);
             self.send.set_visible(!busy);
         }
+        self.provider.set_sensitive(!busy && self.screenshot.is_sensitive());
     }
 
     fn handle(self: &Rc<Self>, event: Event) {
         match event {
-            Event::Claude(generation, event) => {
+            Event::Model(generation, event) => {
                 if generation != self.state.borrow().generation {
                     return;
                 }
                 match event {
-                    ClaudeEvent::Session(id) => self.state.borrow_mut().session = Some(id),
-                    ClaudeEvent::Delta(text) => {
+                    ModelEvent::Session(id) => self.state.borrow_mut().session = Some(id),
+                    ModelEvent::Models(choices) => self.show_models(choices),
+                    ModelEvent::Delta(text) => {
                         let mut s = self.state.borrow_mut();
                         if let Some(turn) = s.turn.as_mut() {
                             turn.reply.push_str(&text);
                             s.dirty = true;
                         }
                     }
-                    ClaudeEvent::Done(text) => self.finish_turn(text),
-                    ClaudeEvent::Failed(message) => self.fail_turn(&message),
+                    ModelEvent::Done(text) => self.finish_turn(text),
+                    ModelEvent::Failed(message) => self.fail_turn(&message),
                 }
             }
-            Event::ClaudeExited(generation, why) => {
-                {
-                    let mut s = self.state.borrow_mut();
+            Event::ModelExited(generation, why) => {
+                let provider = {
+                    let s = self.state.borrow();
                     if generation != s.generation {
                         return;
                     }
-                    s.claude = None;
-                    if why.contains("No conversation found") {
-                        s.session = None;
-                        s.resumable = false;
-                        s.sent = 0;
-                    }
-                }
-                let message = if why.is_empty() {
-                    "The claude process exited."
-                } else {
-                    why.as_str()
+                    s.settings.provider
                 };
-                self.fail_turn(message);
+                let message = if why.is_empty() {
+                    format!("The {} process exited.", provider.label())
+                } else {
+                    why
+                };
+                self.fail_turn(&message);
             }
             Event::Level(generation, speaker, level) => {
                 if generation == self.state.borrow().capture_generation

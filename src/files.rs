@@ -1,8 +1,8 @@
 //! Turns user files into Messages content blocks.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -187,11 +187,61 @@ fn office_text(path: &Path, ext: &str) -> Result<String> {
 }
 
 fn pdf_pages(path: &Path) -> Option<u32> {
-    let out = Command::new("pdfinfo").arg(path).env("LC_ALL", "C").output().ok()?;
+    let out = pdf_tool("pdfinfo").arg(std::path::absolute(path).ok()?).env("LC_ALL", "C").output().ok()?;
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .find_map(|l| l.strip_prefix("Pages:"))
         .and_then(|n| n.trim().parse().ok())
+}
+
+fn pdf_tool(name: &str) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let executable = std::env::current_exe().ok();
+        let bundled = executable.as_deref().and_then(Path::parent).and_then(Path::parent)
+            .map(|root| root.join("poppler").join("bin").join(format!("{name}.exe")))
+            .filter(|path| path.is_file());
+        let mut command = Command::new(bundled.unwrap_or_else(|| format!("{name}.exe").into()));
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command
+    }
+    #[cfg(not(windows))]
+    Command::new(name)
+}
+
+fn pdf_text_command() -> Command {
+    let mut command = pdf_tool("pdftotext");
+    command.args(["-layout", "-enc", "UTF-8"]);
+    command
+}
+
+fn extracted_pdf_text(output: Output) -> Result<String> {
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Converts a pending PDF to text for providers that only take text and images.
+pub fn pdf_text_for_model(encoded: &str) -> Result<String> {
+    let data = STANDARD.decode(encoded).context("invalid PDF attachment")?;
+    let mut child = pdf_text_command().args(["-", "-"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().context("cannot run pdftotext (install Poppler)")?;
+    let mut stdin = child.stdin.take().context("cannot open pdftotext input")?;
+    let writer = std::thread::spawn(move || stdin.write_all(&data));
+    let output = child.wait_with_output();
+    let written = writer.join().map_err(|_| anyhow::anyhow!("cannot write to pdftotext"));
+    let text = extracted_pdf_text(output?)?;
+    written??;
+    if text.trim().is_empty() {
+        bail!("the PDF contains no readable text");
+    }
+    if text.chars().count() > MAX_CHARS {
+        bail!("the PDF exceeds the {MAX_CHARS}-character limit. Split it into parts");
+    }
+    Ok(text)
 }
 
 pub fn load(path: &Path) -> Result<Attachment> {
@@ -231,19 +281,13 @@ pub fn load(path: &Path) -> Result<Attachment> {
         if meta.len() <= MAX_PDF && pages.is_some_and(|p| p <= MAX_PDF_PAGES) {
             return Ok(binary_attachment(&name, "document", "application/pdf", &data));
         }
-        let out = Command::new("pdftotext")
-            .args(["-layout", "-enc", "UTF-8"])
+        let out = pdf_text_command()
             .arg(std::path::absolute(path)?)
             .arg("-")
             .output()
             .context("cannot run pdftotext (install poppler)")?;
-        if !out.status.success() {
-            bail!(
-                "cannot extract text from {name}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        return text_attachment(&name, String::from_utf8_lossy(&out.stdout).into_owned());
+        let text = extracted_pdf_text(out).with_context(|| format!("cannot extract text from {name}"))?;
+        return text_attachment(&name, text);
     }
     match String::from_utf8(data) {
         Ok(text) if !text.contains('\0') => text_attachment(&name, text),

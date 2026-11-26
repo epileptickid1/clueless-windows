@@ -1,11 +1,15 @@
-//! "Keep above other windows" on KDE Plasma. Wayland does not let a program
-//! raise itself, so a one-shot KWin script does it.
+//! "Keep above other windows" via the desktop's native window manager.
 
+#[cfg(not(windows))]
 use std::process::Command;
+#[cfg(not(windows))]
 use std::thread;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(not(windows))]
+use anyhow::{Context, bail};
 
+#[cfg(not(windows))]
 fn gdbus(path: &str, method: &str, args: &[&str]) -> Result<String> {
     let out = Command::new("gdbus")
         .args([
@@ -27,7 +31,8 @@ fn gdbus(path: &str, method: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn apply(above: bool) -> Result<()> {
+#[cfg(not(windows))]
+fn apply(above: bool) -> Result<()> {
     let pid = std::process::id();
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
     let file = std::path::PathBuf::from(runtime).join(format!("clueless-kwin-{pid}.js"));
@@ -58,10 +63,19 @@ pub fn apply(above: bool) -> Result<()> {
     run.map(|_| ())
 }
 
-pub fn apply_in_background(above: bool) {
-    thread::spawn(move || {
-        if let Err(e) = apply(above) {
-            eprintln!("clueless: keep-above unavailable ({e}). Use the window menu instead.");
-        }
-    });
+/// Use the realized GDK Win32 window on the GTK thread. On KDE Plasma a
+/// one-shot KWin script runs off that thread.
+pub fn apply_in_background(window: &gtk4::ApplicationWindow, above: bool) -> Result<()> {
+    #[cfg(windows)]
+    return crate::windows::set_topmost(window, above);
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        thread::spawn(move || {
+            if let Err(e) = apply(above) {
+                eprintln!("clueless: keep-above unavailable ({e}). Use the window menu instead.");
+            }
+        });
+        Ok(())
+    }
 }

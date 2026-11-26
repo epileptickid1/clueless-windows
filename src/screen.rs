@@ -1,17 +1,13 @@
 //! Screenshots of the primary screen.
 //!
-//! Wayland does not let ordinary programs read the screen. On KDE Plasma,
+//! On Windows, use native Win32 capture. On KDE Plasma,
 //! Spectacle may, so it captures the whole desktop and the primary output is
 //! cut out of it, using the layout `kscreen-doctor` reports. Elsewhere `grim`
 //! captures everything.
 
-use std::path::Path;
-use std::process::Command;
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use gtk::gdk_pixbuf::{InterpType, Pixbuf};
 use gtk4 as gtk;
-use serde_json::Value;
 
 use crate::files::{self, Attachment};
 
@@ -19,6 +15,7 @@ use crate::files::{self, Attachment};
 const MAX_EDGE: i32 = 1920;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(not(windows))]
 pub struct Rect {
     pub x: f64,
     pub y: f64,
@@ -28,7 +25,8 @@ pub struct Rect {
 
 /// The primary output and the bounding box of all enabled outputs, in
 /// logical coordinates, from `kscreen-doctor -j`.
-pub fn layout(json: &Value) -> Option<(Rect, Rect)> {
+#[cfg(not(windows))]
+pub fn layout(json: &serde_json::Value) -> Option<(Rect, Rect)> {
     let outputs: Vec<(u64, Rect)> = json["outputs"]
         .as_array()?
         .iter()
@@ -66,6 +64,7 @@ pub fn layout(json: &Value) -> Option<(Rect, Rect)> {
 
 /// Where `primary` lies in an image of the whole desktop `all` that is
 /// `width` × `height` pixels: (x, y, width, height).
+#[cfg(not(windows))]
 pub fn crop(primary: Rect, all: Rect, width: i32, height: i32) -> (i32, i32, i32, i32) {
     let sx = width as f64 / all.width;
     let sy = height as f64 / all.height;
@@ -76,25 +75,27 @@ pub fn crop(primary: Rect, all: Rect, width: i32, height: i32) -> (i32, i32, i32
     (x, y, w, h)
 }
 
-fn run(program: &str, args: &[&str], file: &Path) -> Result<()> {
-    let out = Command::new(program)
+#[cfg(not(windows))]
+fn run(program: &str, args: &[&str], file: &std::path::Path) -> Result<()> {
+    let out = std::process::Command::new(program)
         .args(args)
         .arg(file)
         .output()
         .with_context(|| format!("cannot run {program}"))?;
     if !out.status.success() || !file.exists() {
-        bail!("{program} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!("{program} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn primary_layout() -> Option<(Rect, Rect)> {
-    let out = Command::new("kscreen-doctor").arg("-j").output().ok()?;
+    let out = std::process::Command::new("kscreen-doctor").arg("-j").output().ok()?;
     layout(&serde_json::from_slice(&out.stdout).ok()?)
 }
 
-/// Captures the primary screen as a JPEG attachment. Blocks for about a second.
-pub fn capture() -> Result<Attachment> {
+#[cfg(not(windows))]
+fn capture_pixels() -> Result<Pixbuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -114,8 +115,15 @@ pub fn capture() -> Result<Attachment> {
         })
     });
     let _ = std::fs::remove_file(&file);
-    let image = image.context("cannot take a screenshot (needs Spectacle on KDE Plasma, or grim)")?;
+    image.context("cannot take a screenshot (needs Spectacle on KDE Plasma, or grim)")
+}
 
+/// Captures the primary screen as a JPEG attachment.
+pub fn capture() -> Result<Attachment> {
+    #[cfg(windows)]
+    let image = crate::windows::screen_pixels()?;
+    #[cfg(not(windows))]
+    let image = capture_pixels()?;
     let (w, h) = (image.width(), image.height());
     let scale = (MAX_EDGE as f64 / w.max(h) as f64).min(1.0);
     let image = if scale < 1.0 {
@@ -138,7 +146,7 @@ pub fn capture() -> Result<Attachment> {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
     use serde_json::json;

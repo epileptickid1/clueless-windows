@@ -1,8 +1,12 @@
-//! Clueless: a translucent meeting assistant that talks to Claude through the
-//! user's claude.ai subscription.
+//! Clueless: a translucent meeting assistant that uses signed-in model CLIs.
 
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod antigravity;
 mod audio;
+mod backend;
 mod claude;
+mod codex;
 mod config;
 mod event;
 mod files;
@@ -13,6 +17,8 @@ mod render;
 mod screen;
 mod stt;
 mod ui;
+#[cfg(windows)]
+mod windows;
 
 use gtk::gio;
 use gtk::prelude::*;

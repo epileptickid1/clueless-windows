@@ -1,13 +1,27 @@
 //! Messages sent from background threads to the UI.
 
 use crate::audio::Speaker;
-use crate::claude::ClaudeEvent;
 use crate::files::Attachment;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug)]
+pub enum ModelEvent {
+    Session(String),
+    Models(Vec<ModelChoice>),
+    Delta(String),
+    Done(String),
+    Failed(String),
+}
 
 #[derive(Debug)]
 pub enum Event {
-    Claude(u64, ClaudeEvent),
-    ClaudeExited(u64, String),
+    Model(u64, ModelEvent),
+    ModelExited(u64, String),
     /// Loudness of a capture, 0.0 ..= 1.0.
     Level(u64, Speaker, f32),
     /// Voice activity started or stopped.

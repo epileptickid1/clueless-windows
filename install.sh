@@ -7,7 +7,7 @@ KEY="${XDG_CONFIG_HOME:-$HOME/.config}/clueless/deepgram.key"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 BIN="$HOME/.local/bin"
 
-for tool in cargo claude parec pactl pdftotext pdfinfo gdbus pkg-config; do
+for tool in cargo parec pactl pdftotext pdfinfo gdbus pkg-config; do
     command -v "$tool" >/dev/null || { echo "Missing required program: $tool" >&2; exit 1; }
 done
 pkg-config --atleast-version=4.12 gtk4 || { echo "GTK 4.12 or newer is required" >&2; exit 1; }
@@ -22,7 +22,7 @@ cat > "$DATA/applications/io.github.clueless.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Clueless
-Comment=Translucent meeting assistant powered by Claude
+Comment=Translucent meeting assistant
 Exec="$BIN/clueless"
 Icon=audio-input-microphone
 Terminal=false
@@ -31,6 +31,6 @@ StartupWMClass=io.github.clueless
 EOF
 
 echo "Installed. Start it from the application menu or run: $BIN/clueless"
-claude auth status 2>/dev/null | grep -q '"loggedIn": true' || echo "Sign in first: claude auth login"
+echo "Sign in to your provider: claude auth login, agy acp --login, or codex login"
 [ -s "$KEY" ] || [ -n "${DEEPGRAM_API_KEY:-}" ] ||
     echo "Add your Deepgram API key: (umask 077; mkdir -p '$(dirname "$KEY")'; cat > '$KEY')"

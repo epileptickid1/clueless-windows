@@ -175,7 +175,6 @@ fn connect(config: &Config) -> Result<Socket, ConnectError> {
     tcp.set_nodelay(true).map_err(io)?;
     tcp.set_read_timeout(Some(Duration::from_secs(10))).map_err(io)?;
     tcp.set_write_timeout(Some(Duration::from_secs(10))).map_err(io)?;
-    let handle = tcp.try_clone().map_err(io)?;
 
     let (socket, _) = tungstenite::client_tls(request, tcp).map_err(|e| match e {
         HandshakeError::Failure(tungstenite::Error::Http(response)) => {
@@ -197,7 +196,13 @@ fn connect(config: &Config) -> Result<Socket, ConnectError> {
         e => Retry(e.to_string()),
     })?;
     // From here on reads return quickly, so one thread can send and receive.
-    handle.set_read_timeout(Some(Duration::from_millis(20))).map_err(io)?;
+    // On Windows, changing the timeout on a cloned socket leaves this socket unchanged.
+    let tcp = match socket.get_ref() {
+        MaybeTlsStream::Plain(tcp) => tcp,
+        MaybeTlsStream::NativeTls(tls) => tls.get_ref(),
+        _ => return Err(Fatal("Unsupported TLS transport for Deepgram.".into())),
+    };
+    tcp.set_read_timeout(Some(Duration::from_millis(20))).map_err(io)?;
     Ok(socket)
 }
 
