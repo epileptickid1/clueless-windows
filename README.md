@@ -45,9 +45,37 @@ a message, then select it in Clueless.
 - **Visual Studio and Windows SDK.** Hopefully you already have Visual Studio. In Visual Studio
   Installer, make sure **Desktop development with C++** and the **Windows SDK** are installed.
   The standalone Visual Studio Build Tools also work.
-- **GTK 4.12+.** Use an x64 MSVC build with `pkg-config` or `pkgconf`. To build GTK with its
-  icon theme using gvsbuild, run `gvsbuild build gtk4 adwaita-icon-theme`.
-  [GTK for Windows](https://www.gtk.org/docs/installations/windows/) · [gtk-rs Windows setup](https://gtk-rs.org/gtk4-rs/stable/latest/book/installation_windows.html)
+- **GTK 4.12+.** Use an x64 MSVC build with `pkg-config` or `pkgconf`. 
+	```powershell
+	-winget install Rustlang.Rustup
+	``` 
+	```powershell
+	-rustup default stable-msvc
+	```
+	```powershell
+	-winget install Git.Git MSYS2.MSYS2 astral-sh.uv
+	```
+	```powershell
+	-uv tool install gvsbuild
+	```
+	```powershell
+	-uv tool update-shell
+	```
+	 **close terminal after that and open new one**
+	```powershell 
+	gvsbuild build --vs-ver vs2026 --vs-install-path "C:\Program Files\Microsoft Visual Studio\18\Community" gtk4
+	```
+	 **20-30 min build**
+	```powershell
+	[Environment]::SetEnvironmentVariable("PKG_CONFIG_PATH", "C:\gtk-build\gtk\x64\release\lib\pkgconfig", "User") 
+	
+	[Environment]::SetEnvironmentVariable("Lib", "C:\gtk-build\gtk\x64\release\lib", "User") 
+	
+	$oldPath = [Environment]::GetEnvironmentVariable("Path", "User") 
+	
+	[Environment]::SetEnvironmentVariable("Path", "$oldPath;C:\gtk-build\gtk\x64\release\bin", "User")
+	```
+[GTK for Windows](https://www.gtk.org/docs/installations/windows/) · [gtk-rs Windows setup](https://gtk-rs.org/gtk4-rs/stable/latest/book/installation_windows.html)
 
 ```powershell
 .\build-windows.ps1 -GtkRoot 'C:\gtk-build\gtk\x64\release' -RunTests
