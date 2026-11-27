@@ -52,25 +52,25 @@ a message, then select it in Clueless.
   The standalone Visual Studio Build Tools also work.
 - **GTK 4.12+.** Use an x64 MSVC build with `pkg-config` or `pkgconf`. 
 	```powershell
-	-winget install Rustlang.Rustup
+	winget install Rustlang.Rustup
 	``` 
 	```powershell
-	-rustup default stable-msvc
+	rustup default stable-msvc
 	```
 	```powershell
-	-winget install Git.Git MSYS2.MSYS2 astral-sh.uv
+	winget install Git.Git MSYS2.MSYS2 astral-sh.uv
 	```
 	```powershell
-	-uv tool install gvsbuild
+	uv tool install gvsbuild
 	```
 	```powershell
-	-uv tool update-shell
+	uv tool update-shell
 	```
 	 **close terminal after that and open new one**
 	```powershell 
 	gvsbuild build --vs-ver vs2026 --vs-install-path "C:\Program Files\Microsoft Visual Studio\18\Community" gtk4
 	```
-	 **20-30 min build**
+	 **20-30 min build**, then you can delete everything in C:\gtk-build\ EXCEPT C:\gtk-build\gtk
 	```powershell
 	[Environment]::SetEnvironmentVariable("PKG_CONFIG_PATH", "C:\gtk-build\gtk\x64\release\lib\pkgconfig", "User") 
 	
