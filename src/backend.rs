@@ -20,10 +20,11 @@ pub enum Backend {
 impl Backend {
     pub fn spawn(settings: &Settings, resume: Option<&str>, generation: u64, events: Sender<Event>) -> Result<Self> {
         let model = settings.model_id();
+        let effort = settings.effort();
         match settings.provider {
-            Provider::Claude => Claude::spawn(model, resume, generation, events).map(Self::Claude),
-            Provider::Antigravity => Antigravity::spawn(model, resume, generation, events).map(Self::Antigravity),
-            Provider::Codex => Codex::spawn(model, resume, settings.codex_fast, generation, events).map(Self::Codex),
+            Provider::Claude => Claude::spawn(model, effort, resume, generation, events).map(Self::Claude),
+            Provider::Antigravity => Antigravity::spawn(model, effort, resume, generation, events).map(Self::Antigravity),
+            Provider::Codex => Codex::spawn(model, effort, resume, settings.codex_fast, generation, events).map(Self::Codex),
         }
     }
 

@@ -1,5 +1,6 @@
 //! Paths and persisted user settings.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
@@ -114,6 +115,7 @@ pub struct Settings {
     pub antigravity_model: String,
     pub codex_model: String,
     pub codex_fast: bool,
+    efforts: BTreeMap<String, String>,
     pub language: u32,
 }
 
@@ -129,12 +131,30 @@ impl Default for Settings {
             antigravity_model: String::new(),
             codex_model: String::new(),
             codex_fast: false,
+            efforts: BTreeMap::new(),
             language: 0,
         }
     }
 }
 
 impl Settings {
+    fn effort_key(&self) -> String {
+        format!("{}/{}", self.provider.id(), self.model_id())
+    }
+
+    pub fn effort(&self) -> Option<&str> {
+        self.efforts.get(&self.effort_key()).map(String::as_str)
+    }
+
+    pub fn select_effort(&mut self, effort: String) {
+        let key = self.effort_key();
+        if effort.is_empty() {
+            self.efforts.remove(&key);
+        } else {
+            self.efforts.insert(key, effort);
+        }
+    }
+
     pub fn model_id(&self) -> &str {
         match self.provider {
             Provider::Claude => MODELS.get(self.model as usize).copied().unwrap_or(MODELS[0]),
@@ -172,6 +192,7 @@ impl Settings {
             antigravity_model: v["antigravity_model"].as_str().unwrap_or_default().to_string(),
             codex_model: v["codex_model"].as_str().unwrap_or_default().to_string(),
             codex_fast: flag("codex_fast", d.codex_fast),
+            efforts: serde_json::from_value(v["efforts"].clone()).unwrap_or_default(),
             language: index("language", LANGUAGES.len()),
         }
     }
@@ -187,6 +208,7 @@ impl Settings {
             "antigravity_model": self.antigravity_model,
             "codex_model": self.codex_model,
             "codex_fast": self.codex_fast,
+            "efforts": self.efforts,
             "language": self.language,
         })
     }
@@ -220,13 +242,23 @@ mod tests {
         assert_eq!(settings.provider, Provider::Claude);
         assert_eq!(settings.model_id(), "opus");
         assert!(!settings.codex_fast);
+        assert_eq!(settings.effort(), None);
+        settings.select_effort("medium".into());
 
         settings.provider = Provider::Codex;
         settings.select_model("codex-model".into());
+        settings.select_effort("high".into());
         settings.codex_fast = true;
-        let restored = Settings::from_json(&settings.to_json());
+        let mut restored = Settings::from_json(&settings.to_json());
         assert_eq!(restored, settings);
         assert_eq!(restored.model_id(), "codex-model");
+        assert_eq!(restored.effort(), Some("high"));
+        restored.select_model("another-model".into());
+        assert_eq!(restored.effort(), None);
+        restored.provider = Provider::Claude;
         assert_eq!(restored.model, 2);
+        assert_eq!(restored.effort(), Some("medium"));
+        restored.select_effort(String::new());
+        assert_eq!(restored.effort(), None);
     }
 }

@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::claude::SYSTEM_PROMPT;
-use crate::event::{Event, ModelChoice, ModelEvent};
+use crate::event::{EffortChoice, Event, ModelChoice, ModelEvent};
 
 const CHAT_ONLY: &str = "Answer from the supplied conversation and attachments. Do not use tools, \
     run commands, read or write local files, browse, or delegate work.";
@@ -21,7 +21,7 @@ pub struct Antigravity {
 }
 
 impl Antigravity {
-    pub fn spawn(model: &str, resume: Option<&str>, generation: u64, events: Sender<Event>) -> Result<Self> {
+    pub fn spawn(model: &str, effort: Option<&str>, resume: Option<&str>, generation: u64, events: Sender<Event>) -> Result<Self> {
         let cwd = std::path::absolute(crate::config::data_dir().join("antigravity"))?;
         std::fs::create_dir_all(&cwd).with_context(|| format!("cannot create {}", cwd.display()))?;
         let program = std::env::var_os("CLUELESS_AGY").unwrap_or_else(|| "agy".into());
@@ -58,10 +58,11 @@ impl Antigravity {
 
         let (prompts, incoming) = channel();
         let model = model.to_owned();
+        let effort = effort.map(str::to_owned);
         let resume = resume.map(str::to_owned);
         thread::spawn(move || {
             let mut acp = Acp::new(BufReader::new(output), BufWriter::new(input), generation, events.clone());
-            if let Err(error) = acp.run(&cwd, &model, resume.as_deref(), incoming) {
+            if let Err(error) = acp.run(&cwd, &model, effort.as_deref(), resume.as_deref(), incoming) {
                 let _ = events.send(Event::ModelExited(generation, format!("{error:#}")));
             }
         });
@@ -158,7 +159,7 @@ impl<R: BufRead, W: Write> Acp<R, W> {
         }
     }
 
-    fn run(&mut self, cwd: &Path, model: &str, resume: Option<&str>, incoming: Receiver<Vec<Value>>) -> Result<()> {
+    fn run(&mut self, cwd: &Path, model: &str, effort: Option<&str>, resume: Option<&str>, incoming: Receiver<Vec<Value>>) -> Result<()> {
         let (hello, _) = self.request(
             "initialize",
             json!({
@@ -195,9 +196,8 @@ impl<R: BufRead, W: Write> Acp<R, W> {
         let (setup, _) = self.request(setup_method, params, None)?;
         let session_id = setup["sessionId"].as_str().or(resume).context("Antigravity returned no session ID")?;
         self.publish_models(&setup);
-        if !model.is_empty() {
-            self.select_model(&setup, session_id, model)?;
-        }
+        let selected = if model.is_empty() { None } else { self.select_model(&setup, session_id, model)? };
+        self.configure_effort(selected.as_ref().unwrap_or(&setup), session_id, model, effort)?;
         self.emit(ModelEvent::Session(session_id.into()));
 
         let prompt_capabilities = &capabilities["promptCapabilities"];
@@ -244,10 +244,10 @@ impl<R: BufRead, W: Write> Acp<R, W> {
         }
     }
 
-    fn select_model(&mut self, response: &Value, session_id: &str, model: &str) -> Result<()> {
+    fn select_model(&mut self, response: &Value, session_id: &str, model: &str) -> Result<Option<Value>> {
         if let Some(config) = model_config(response) {
             if config["currentValue"].as_str() == Some(model) {
-                return Ok(());
+                return Ok(None);
             }
             let config_id = config["id"].as_str().context("Antigravity model option has no ID")?;
             let (options, _) = self.request(
@@ -256,17 +256,51 @@ impl<R: BufRead, W: Write> Acp<R, W> {
                 Some(session_id),
             )?;
             self.publish_models(&options);
+            return Ok(Some(options));
         } else if response["models"].is_object() {
             if response["models"]["currentModelId"].as_str() != Some(model) {
                 self.request("session/set_model", json!({"sessionId": session_id, "modelId": model}), None)?;
             }
         } else {
             // Resume responses may omit configOptions. Antigravity's model option ID is `model`.
-            self.request(
+            let (options, _) = self.request(
                 "session/set_config_option",
                 json!({"sessionId": session_id, "configId": "model", "value": model}),
                 Some(session_id),
             )?;
+            self.publish_models(&options);
+            return Ok(Some(options));
+        }
+        Ok(None)
+    }
+
+    fn configure_effort(&mut self, response: &Value, session_id: &str, model: &str, effort: Option<&str>) -> Result<()> {
+        let option = thought_config(response);
+        let current = option.and_then(|config| config["currentValue"].as_str());
+        let mut choices = Vec::new();
+        if let Some(config) = option {
+            collect_options(&config["options"], &mut |id, label| {
+                choices.push(EffortChoice { id: id.into(), label: label.into() });
+            });
+        }
+        if let Some(effort) = effort.filter(|&effort| Some(effort) != current) {
+            if !choices.iter().any(|choice| choice.id == effort) {
+                self.emit(ModelEvent::Efforts { model: model.into(), choices, current: current.map(str::to_owned) });
+                bail!("Antigravity does not offer effort {effort} for this model. Choose an available level.");
+            }
+            let config_id = option.and_then(|config| config["id"].as_str()).context("Antigravity's thinking level option has no ID")?;
+            let (updated, _) = self.request(
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": config_id, "value": effort}),
+                Some(session_id),
+            )?;
+            if thought_config(&updated).and_then(|config| config["currentValue"].as_str()) != Some(effort) {
+                bail!("Antigravity did not confirm effort {effort}.");
+            }
+            return self.configure_effort(&updated, session_id, model, None);
+        }
+        if !choices.is_empty() {
+            self.emit(ModelEvent::Efforts { model: model.into(), choices, current: current.map(str::to_owned) });
         }
         Ok(())
     }
@@ -297,14 +331,25 @@ fn model_config(response: &Value) -> Option<&Value> {
     })
 }
 
+fn thought_config(response: &Value) -> Option<&Value> {
+    response["configOptions"].as_array()?.iter().find(|entry| {
+        entry["type"] == "select"
+            && (entry["category"] == "thought_level" || matches!(entry["id"].as_str(), Some("thought_level" | "thinking_level")))
+    })
+}
+
 fn collect_model_options(options: &Value, models: &mut Vec<ModelChoice>) {
+    collect_options(options, &mut |id, label| models.push(ModelChoice { id: id.into(), label: label.into() }));
+}
+
+fn collect_options(options: &Value, add: &mut impl FnMut(&str, &str)) {
     if let Some(options) = options.as_array() {
         for option in options {
             if let Some(id) = option["value"].as_str() {
                 let label = option["name"].as_str().unwrap_or(id);
-                models.push(ModelChoice { id: id.into(), label: label.into() });
+                add(id, label);
             } else if let Some(group) = option.get("options") {
-                collect_model_options(group, models);
+                collect_options(group, add);
             }
         }
     }
@@ -347,6 +392,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn applies_the_selected_model_thinking_level_before_prompting() {
+        let transcript = br#"
+{"id":1,"result":{"protocolVersion":1}}
+{"id":2,"result":{"sessionId":"s1","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"a","options":[{"value":"a"},{"value":"b"}]}]}}
+{"id":3,"result":{"configOptions":[{"id":"thinking-level","category":"thought_level","type":"select","currentValue":"low","options":[{"value":"low"},{"value":"high"}]}]}}
+{"id":4,"result":{"configOptions":[{"id":"thinking-level","category":"thought_level","type":"select","currentValue":"high","options":[{"value":"low"},{"value":"high"}]}]}}
+{"id":5,"result":{"stopReason":"end_turn"}}
+"#;
+        let (events, received) = channel();
+        let (prompts, queue) = channel();
+        prompts.send(vec![json!({"type":"text", "text":"Hi"})]).unwrap();
+        drop(prompts);
+        let mut acp = Acp::new(&transcript[..], Vec::new(), 42, events);
+        acp.run(Path::new("test"), "b", Some("high"), None, queue).unwrap();
+        let requests: Vec<Value> = std::str::from_utf8(&acp.writer).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(requests[2]["params"]["value"], "b");
+        assert_eq!(requests[3]["method"], "session/set_config_option");
+        assert_eq!(requests[3]["params"], json!({"sessionId":"s1", "configId":"thinking-level", "value":"high"}));
+        assert_eq!(requests[4]["method"], "session/prompt");
+        assert!(received.try_iter().any(|event| matches!(event, Event::Model(42,
+            ModelEvent::Efforts { current: Some(level), .. }) if level == "high")));
+    }
+
+    #[test]
+    fn rejects_an_unconfirmed_thinking_level() {
+        let options = json!({"configOptions":[{
+            "id":"thinking_level", "type":"select", "currentValue":"low", "options":[{"value":"low"}, {"value":"high"}]
+        }]});
+        let reply = json!({"id":1, "result":options}).to_string() + "\n";
+        let (events, _) = channel();
+        let mut acp = Acp::new(reply.as_bytes(), Vec::new(), 42, events);
+        let error = acp.configure_effort(&options, "s1", "model", Some("high")).unwrap_err();
+        assert!(error.to_string().contains("did not confirm effort high"));
+    }
+
+    #[test]
     fn resumes_with_selected_model_and_streams_prompt_turns() {
         let transcript = br#"
 {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{},"systemPrompt":{}},"promptCapabilities":{"image":true,"embeddedContext":true}}}}
@@ -371,7 +453,7 @@ mod tests {
         ]).unwrap();
         drop(prompts);
         let mut acp = Acp::new(&transcript[..], Vec::new(), 42, events);
-        acp.run(Path::new("test"), "b", Some("s1"), queue).unwrap();
+        acp.run(Path::new("test"), "b", None, Some("s1"), queue).unwrap();
 
         let request: Vec<Value> = acp.writer.split(|&byte| byte == b'\n')
             .filter(|line| !line.is_empty()).map(|line| serde_json::from_slice(line).unwrap()).collect();

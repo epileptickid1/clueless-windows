@@ -82,7 +82,7 @@ pub struct Claude {
 impl Claude {
     /// Starts the CLI. Events are delivered tagged with `generation`, so that
     /// output from a replaced process can be ignored.
-    pub fn spawn(model: &str, resume: Option<&str>, generation: u64, events: Sender<Event>) -> Result<Claude> {
+    pub fn spawn(model: &str, effort: Option<&str>, resume: Option<&str>, generation: u64, events: Sender<Event>) -> Result<Claude> {
         let cwd = crate::config::data_dir().join("session");
         std::fs::create_dir_all(&cwd).with_context(|| format!("cannot create {}", cwd.display()))?;
 
@@ -105,6 +105,9 @@ impl Claude {
             .stderr(Stdio::piped());
         if let Some(id) = resume {
             cmd.args(["--resume", id]);
+        }
+        if let Some(effort) = effort {
+            cmd.args(["--effort", effort]);
         }
         for (key, _) in std::env::vars_os() {
             let k = key.to_string_lossy();

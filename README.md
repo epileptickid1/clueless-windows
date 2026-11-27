@@ -20,6 +20,11 @@ the provider's default model. Switching providers or returning to **CLI default*
 provider session. For Codex, **Fast mode** requests the Fast service tier and takes effect on
 the next response. It is off by default and the choice is saved between launches.
 
+Use **Effort** next to the model to change its reasoning level for the next answer. Clueless
+remembers the choice per provider and model. Codex and Antigravity supply the levels their
+models offer. **Default**, where shown, follows the CLI configuration. Claude Code can lower
+the requested effort according to the active model and account limits.
+
 ### Linux
 
 ```sh
@@ -129,6 +134,7 @@ requested, the whole question is answered again. These timings are constants at 
 | Mic | Also transcribe your own voice as `You` (use headphones, or it hears the call twice) |
 | Language | Set it explicitly. *Multilingual* does not cover Ukrainian or Polish |
 | Provider / Model | Choose a signed-in CLI and a model. Claude offers `sonnet`, `haiku`, `opus` |
+| Effort | Set the reasoning level for the next answer |
 | Fast mode | Request the Fast service tier for Codex |
 | Stop / Escape | Interrupt a reply |
 | New chat | Forget the conversation, transcript and sent files |

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::audio::{self, Capture, Source, Speaker};
 use crate::backend::Backend;
 use crate::config::{self, Provider, Settings};
-use crate::event::{Event, ModelChoice, ModelEvent};
+use crate::event::{EffortChoice, Event, ModelChoice, ModelEvent};
 use crate::files::{self, Attachment};
 use crate::gate::{Gate, Reason};
 use crate::{kwin, render, stt};
@@ -115,6 +115,7 @@ struct State {
     settings: Settings,
     backend: Option<Backend>,
     model_choices: Vec<ModelChoice>,
+    effort_choices: Vec<EffortChoice>,
     generation: u64,
     session: Option<String>,
     /// The session has at least one finished turn, so it can be resumed.
@@ -177,6 +178,7 @@ pub struct App {
     source: gtk::DropDown,
     provider: gtk::DropDown,
     model: gtk::DropDown,
+    effort: gtk::DropDown,
     fast: gtk::CheckButton,
     level: gtk::LevelBar,
     transcript: gtk::TextView,
@@ -196,6 +198,8 @@ pub struct App {
     events: Sender<Event>,
     refreshing: Cell<bool>,
     updating_models: Cell<bool>,
+    updating_efforts: Cell<bool>,
+    refresh_models_after_reply: Cell<bool>,
     discard_screenshot: Cell<bool>,
 }
 
@@ -364,6 +368,8 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     model.set_hexpand(true);
     model.set_factory(Some(&ellipsizing_factory()));
     model.set_tooltip_text(Some("Model"));
+    let effort = gtk::DropDown::from_strings(&[]);
+    effort.set_tooltip_text(Some("Reasoning effort for the next answer. Default follows the provider settings."));
     let fast = gtk::CheckButton::with_label("Fast mode");
     fast.set_active(settings.codex_fast);
     fast.set_visible(settings.provider == Provider::Codex);
@@ -385,6 +391,8 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     let model_row = row();
     model_row.append(&provider);
     model_row.append(&model);
+    model_row.append(&gtk::Label::new(Some("Effort")));
+    model_row.append(&effort);
     model_row.append(&fast);
     let action_row = row();
     action_row.append(&answer);
@@ -474,6 +482,7 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
         source,
         provider,
         model,
+        effort,
         fast,
         level,
         transcript,
@@ -494,6 +503,8 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
         events,
         refreshing: Cell::new(false),
         updating_models: Cell::new(false),
+        updating_efforts: Cell::new(false),
+        refresh_models_after_reply: Cell::new(false),
         discard_screenshot: Cell::new(false),
     });
 
@@ -553,6 +564,12 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
     app.model.connect_selected_notify(move |d| {
         if !a.updating_models.get() {
             a.select_model(d.selected() as usize);
+        }
+    });
+    let a = app.clone();
+    app.effort.connect_selected_notify(move |d| {
+        if !a.updating_efforts.get() {
+            a.select_effort(d.selected() as usize);
         }
     });
     let a = app.clone();
@@ -685,6 +702,7 @@ pub fn build(application: &gtk::Application) -> Rc<App> {
 
     app.refresh_sources();
     app.show_models(Vec::new());
+    app.reset_efforts();
     window.present();
     app.input.grab_focus();
     if keep_above {
@@ -718,10 +736,21 @@ impl App {
             if s.settings.provider == Provider::Claude {
                 return;
             }
+            if s.turn.is_some() {
+                self.refresh_models_after_reply.set(true);
+                return;
+            }
+            self.refresh_models_after_reply.set(false);
             s.ensure_backend(&self.events)
         };
         if let Err(error) = result {
             self.set_status(&format!("{error:#}"));
+        }
+    }
+
+    fn refresh_model_list_after_reply(&self) {
+        if self.refresh_models_after_reply.replace(false) {
+            self.prepare_model_list();
         }
     }
 
@@ -746,6 +775,7 @@ impl App {
         }
         self.fast.set_visible(provider == Provider::Codex);
         self.show_models(Vec::new());
+        self.reset_efforts();
         self.set_status(&format!("{} selected. The next request starts a new conversation.", provider.label()));
         self.prepare_model_list();
     }
@@ -791,6 +821,68 @@ impl App {
         s.settings.select_model(id);
         s.settings.save();
         s.restart_backend_after_reply(restart);
+        drop(s);
+        self.reset_efforts();
+        self.prepare_model_list();
+    }
+
+    fn reset_efforts(&self) {
+        let claude = self.state.borrow().settings.provider == Provider::Claude;
+        let choices = if claude {
+            [("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "Extra high"), ("max", "Max")]
+                .into_iter().map(|(id, label)| EffortChoice { id: id.into(), label: label.into() }).collect()
+        } else {
+            Vec::new()
+        };
+        self.show_efforts(choices, None);
+    }
+
+    fn show_efforts(&self, mut choices: Vec<EffortChoice>, current: Option<String>) {
+        let (labels, selected, enabled) = {
+            let mut s = self.state.borrow_mut();
+            let saved = s.settings.effort();
+            if (s.settings.provider != Provider::Antigravity && !choices.is_empty())
+                || (choices.is_empty() && saved.is_some())
+            {
+                choices.insert(0, EffortChoice { id: String::new(), label: "Default".into() });
+            }
+            let wanted = saved.or(current.as_deref()).unwrap_or_default();
+            let selected = choices.iter().position(|choice| choice.id == wanted).unwrap_or_else(|| {
+                if let Some(saved) = saved {
+                    choices.push(EffortChoice { id: saved.into(), label: format!("Effort: {saved}") });
+                    return choices.len() - 1;
+                }
+                0
+            });
+            s.effort_choices = choices;
+            let enabled = s.effort_choices.len() > 1;
+            let labels = if s.effort_choices.is_empty() {
+                vec!["—".into()]
+            } else {
+                s.effort_choices.iter().map(|choice| choice.label.clone()).collect()
+            };
+            (labels, selected, enabled)
+        };
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        self.updating_efforts.set(true);
+        self.effort.set_model(Some(&gtk::StringList::new(&labels)));
+        self.effort.set_selected(selected as u32);
+        self.effort.set_sensitive(enabled);
+        self.updating_efforts.set(false);
+    }
+
+    fn select_effort(&self, index: usize) {
+        let mut s = self.state.borrow_mut();
+        let Some(choice) = s.effort_choices.get(index) else { return };
+        if s.settings.effort().unwrap_or_default() == choice.id {
+            return;
+        }
+        let id = choice.id.clone();
+        s.settings.select_effort(id);
+        s.settings.save();
+        if s.restart_after_turn != Some(Restart::NewSession) {
+            s.restart_backend_after_reply(Restart::Resume);
+        }
     }
 
     fn chat_append(&self, text: &str, tags: &[&str]) {
@@ -1321,6 +1413,7 @@ impl App {
         }
         self.show_chips();
         self.set_status("The request failed. Your message and files were kept.");
+        self.refresh_model_list_after_reply();
     }
 
     fn stop_reply(self: &Rc<Self>) {
@@ -1345,6 +1438,7 @@ impl App {
         self.chat_append("(stopped)\n", &["dim"]);
         self.set_status("Stopped.");
         self.show_chips();
+        self.refresh_model_list_after_reply();
     }
 
     fn new_chat(self: &Rc<Self>) {
@@ -1367,6 +1461,7 @@ impl App {
         self.transcript.buffer().set_text("");
         self.chat.buffer().set_text("");
         self.set_status("New chat. Attach your materials again if you need them.");
+        self.refresh_model_list_after_reply();
     }
 
     // ----- event loop -----
@@ -1421,6 +1516,11 @@ impl App {
                 match event {
                     ModelEvent::Session(id) => self.state.borrow_mut().session = Some(id),
                     ModelEvent::Models(choices) => self.show_models(choices),
+                    ModelEvent::Efforts { model, choices, current } => {
+                        if self.state.borrow().settings.model_id() == model {
+                            self.show_efforts(choices, current);
+                        }
+                    }
                     ModelEvent::Delta(text) => {
                         let mut s = self.state.borrow_mut();
                         if let Some(turn) = s.turn.as_mut() {
@@ -1428,7 +1528,10 @@ impl App {
                             s.dirty = true;
                         }
                     }
-                    ModelEvent::Done(text) => self.finish_turn(text),
+                    ModelEvent::Done(text) => {
+                        self.finish_turn(text);
+                        self.refresh_model_list_after_reply();
+                    }
                     ModelEvent::Failed(message) => self.fail_turn(&message),
                 }
             }

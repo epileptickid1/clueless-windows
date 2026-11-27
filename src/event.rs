@@ -10,9 +10,16 @@ pub struct ModelChoice {
 }
 
 #[derive(Debug)]
+pub struct EffortChoice {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug)]
 pub enum ModelEvent {
     Session(String),
     Models(Vec<ModelChoice>),
+    Efforts { model: String, choices: Vec<EffortChoice>, current: Option<String> },
     Delta(String),
     Done(String),
     Failed(String),

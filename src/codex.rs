@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::claude::SYSTEM_PROMPT;
-use crate::event::{Event, ModelChoice, ModelEvent};
+use crate::event::{EffortChoice, Event, ModelChoice, ModelEvent};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_TIMEOUT: Duration = Duration::from_secs(180);
@@ -31,7 +31,7 @@ pub struct Codex {
 }
 
 impl Codex {
-    pub fn spawn(model: &str, resume: Option<&str>, fast: bool, generation: u64, events: Sender<Event>) -> Result<Self> {
+    pub fn spawn(model: &str, effort: Option<&str>, resume: Option<&str>, fast: bool, generation: u64, events: Sender<Event>) -> Result<Self> {
         let cwd = crate::config::data_dir().join("codex");
         std::fs::create_dir_all(&cwd).with_context(|| format!("cannot create {}", cwd.display()))?;
         let cwd = std::path::absolute(cwd)?;
@@ -89,13 +89,14 @@ impl Codex {
         });
 
         let model = model.to_owned();
+        let effort = effort.map(str::to_owned);
         let resume = resume.map(str::to_owned);
         thread::spawn(move || {
             let emit = |event| {
                 let _ = events.send(Event::Model(generation, event));
             };
             let rpc = Rpc { stdin, incoming, next_id: 0, pending: VecDeque::new() };
-            if let Err(error) = run(rpc, &cwd, &model, resume.as_deref(), fast, &emit) {
+            if let Err(error) = run(rpc, &cwd, &model, effort.as_deref(), resume.as_deref(), fast, &emit) {
                 let reason = if error.is::<RpcClosed>() {
                     let lines = tail.lock().unwrap_or_else(|e| e.into_inner());
                     let details = lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n");
@@ -254,6 +255,7 @@ fn run(
     mut rpc: Rpc,
     cwd: &Path,
     model: &str,
+    effort: Option<&str>,
     resume: Option<&str>,
     fast: bool,
     emit: &impl Fn(ModelEvent),
@@ -273,9 +275,33 @@ fn run(
     // An empty mcp_servers table merges with inherited configuration. Disable each configured server for our thread.
     let config = rpc.call("config/read", json!({"cwd": cwd, "includeLayers": false}), |_| {})?;
     let disabled_mcp = disabled_mcp_servers(&config);
+    let mut overrides = serde_json::Map::new();
+    if !disabled_mcp.is_empty() {
+        overrides.insert("mcp_servers".into(), json!(disabled_mcp));
+    }
+    if let Some(effort) = effort {
+        overrides.insert("model_reasoning_effort".into(), json!(effort));
+    }
 
     if let Ok(models) = list_models(&mut rpc) {
-        emit(ModelEvent::Models(models));
+        let configured_model = config["config"]["model"].as_str().unwrap_or_default();
+        let selected = if model.is_empty() { configured_model } else { model };
+        let entry = models.iter().find(|entry| {
+            if selected.is_empty() {
+                entry["isDefault"].as_bool() == Some(true)
+            } else {
+                entry["id"].as_str() == Some(selected) || entry["model"].as_str() == Some(selected)
+            }
+        });
+        let choices = entry.map(effort_choices).unwrap_or_default();
+        emit(ModelEvent::Efforts { model: model.into(), choices, current: None });
+        emit(ModelEvent::Models(models.iter().filter_map(|entry| {
+            let id = entry["id"].as_str()?;
+            let label = entry["displayName"].as_str().unwrap_or(id);
+            Some(ModelChoice { id: id.into(), label: label.into() })
+        }).collect()));
+    } else {
+        emit(ModelEvent::Efforts { model: model.into(), choices: Vec::new(), current: None });
     }
 
     let mut current_thread = None;
@@ -290,8 +316,8 @@ fn run(
         };
         if current_thread.is_none() {
             let (method, mut params) = thread_request(cwd, model, resume, fast);
-            if !disabled_mcp.is_empty() {
-                params["config"] = json!({"mcp_servers": disabled_mcp});
+            if !overrides.is_empty() {
+                params["config"] = json!(overrides);
             }
             let state = rpc.call(method, params, |_| {}).map_err(|e| {
                 if resume.is_some() && e.to_string().contains("no rollout found") {
@@ -301,12 +327,18 @@ fn run(
                 }
             })?;
             verify_tier(&state, fast)?;
+            if let Some(effort) = effort
+                && state["reasoningEffort"].as_str() != Some(effort)
+            {
+                let applied = state["reasoningEffort"].as_str().unwrap_or("unset");
+                bail!("Codex returned effort {applied} instead of {effort}. Choose a supported effort or Default.");
+            }
             let id = state["thread"]["id"].as_str().context("Codex did not return a thread ID")?;
             emit(ModelEvent::Session(id.to_owned()));
             current_thread = Some(id.to_owned());
         }
         let thread = current_thread.as_deref().expect("Codex thread was initialized");
-        run_turn(&mut rpc, thread, input, fast, emit)?;
+        run_turn(&mut rpc, thread, input, fast, effort, emit)?;
     }
 }
 
@@ -319,17 +351,13 @@ fn disabled_mcp_servers(config: &Value) -> serde_json::Map<String, Value> {
         .collect()
 }
 
-fn list_models(rpc: &mut Rpc) -> Result<Vec<ModelChoice>> {
+fn list_models(rpc: &mut Rpc) -> Result<Vec<Value>> {
     let mut models = Vec::new();
     let mut cursor = None;
     loop {
         let result = rpc.call("model/list", json!({"limit": 100, "cursor": cursor, "includeHidden": false}), |_| {})?;
         if let Some(data) = result["data"].as_array() {
-            models.extend(data.iter().filter_map(|model| {
-                let id = model["id"].as_str()?;
-                let label = model["displayName"].as_str().unwrap_or(id);
-                Some(ModelChoice { id: id.into(), label: label.into() })
-            }));
+            models.extend(data.iter().cloned());
         }
         let next = result["nextCursor"].as_str().map(str::to_owned);
         if next.is_none() || next == cursor {
@@ -337,6 +365,13 @@ fn list_models(rpc: &mut Rpc) -> Result<Vec<ModelChoice>> {
         }
         cursor = next;
     }
+}
+
+fn effort_choices(model: &Value) -> Vec<EffortChoice> {
+    model["supportedReasoningEfforts"].as_array().into_iter().flatten().filter_map(|entry| {
+        let id = entry["reasoningEffort"].as_str().filter(|id| !id.is_empty())?;
+        Some(EffortChoice { id: id.into(), label: id.into() })
+    }).collect()
 }
 
 fn service_tier(fast: bool) -> &'static str {
@@ -399,13 +434,17 @@ fn codex_input(content: Vec<Value>) -> Result<Vec<Value>> {
         .collect()
 }
 
-fn turn_params(thread: &str, input: Vec<Value>, fast: bool) -> Value {
-    json!({"threadId": thread, "input": input, "serviceTier": service_tier(fast)})
+fn turn_params(thread: &str, input: Vec<Value>, fast: bool, effort: Option<&str>) -> Value {
+    let mut params = json!({"threadId": thread, "input": input, "serviceTier": service_tier(fast)});
+    if let Some(effort) = effort {
+        params["effort"] = json!(effort);
+    }
+    params
 }
 
-fn run_turn(rpc: &mut Rpc, thread: &str, input: Vec<Value>, fast: bool, emit: &impl Fn(ModelEvent)) -> Result<()> {
+fn run_turn(rpc: &mut Rpc, thread: &str, input: Vec<Value>, fast: bool, effort: Option<&str>, emit: &impl Fn(ModelEvent)) -> Result<()> {
     let mut queued = VecDeque::new();
-    let result = rpc.call("turn/start", turn_params(thread, input, fast), |message| queued.push_back(message))?;
+    let result = rpc.call("turn/start", turn_params(thread, input, fast, effort), |message| queued.push_back(message))?;
     let turn_id = result["turn"]["id"].as_str().context("Codex did not return a turn ID")?;
     let mut reply = CodexReply::default();
     let deadline = Instant::now() + TURN_TIMEOUT;
@@ -480,7 +519,11 @@ mod tests {
             assert_eq!(resume, "thread/resume");
             assert_eq!(start_params["serviceTier"], expected);
             assert_eq!(resume_params["serviceTier"], expected);
-            assert_eq!(turn_params("thread", vec![], fast)["serviceTier"], expected);
+            for effort in [None, Some("low"), Some("high")] {
+                let params = turn_params("thread", vec![], fast, effort);
+                assert_eq!(params["serviceTier"], expected);
+                assert_eq!(params.get("effort").and_then(Value::as_str), effort);
+            }
             assert!(verify_tier(&json!({"serviceTier": acknowledged}), fast).is_ok());
         }
         assert!(verify_tier(&json!({"serviceTier": "default"}), true).is_err());
