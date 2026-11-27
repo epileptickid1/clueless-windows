@@ -65,7 +65,7 @@ a message, then select it in Clueless.
 	```powershell 
 	gvsbuild build --vs-ver vs2026 --vs-install-path "C:\Program Files\Microsoft Visual Studio\18\Community" gtk4
 	```
-	 **20-30 min build**
+	 **20-30 min build**, then you can delete everything in C:\gtk-build\ EXCEPT C:\gtk-build\gtk
 	```powershell
 	[Environment]::SetEnvironmentVariable("PKG_CONFIG_PATH", "C:\gtk-build\gtk\x64\release\lib\pkgconfig", "User") 
 	
